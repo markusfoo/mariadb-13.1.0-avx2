@@ -458,7 +458,7 @@ jobs:
       PRERELEASE: ${{ needs.resolve.outputs.prerelease }}
     steps:
       - name: Download all build artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
 
       - name: Prepare assets, notes and checksums
         shell: bash
