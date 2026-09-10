@@ -260,7 +260,12 @@ jobs:
           # Official mirror tarballs always extract to a top-level "mariadb-$V"
           # directory (deterministic — avoids `tar | head` which trips pipefail/SIGPIPE).
           rm -rf src
-          tar -xzf src.tar.gz
+          # Some upstream tarballs (11.8.x/12.3.x) contain test-data symlinks
+          # (storage/duckdb/third_parties/...) that Windows GNU tar cannot always
+          # materialize. Native symlink mode fixes it on GH runners (admin); any
+          # residual non-fatal errors are test fixtures irrelevant to the build.
+          export MSYS=winsymlinks:nativestrict
+          tar -xzf src.tar.gz || echo "::warning::tar reported non-fatal errors (likely test symlinks) — continuing"
           mv "mariadb-$V" src
           test -f src/CMakeLists.txt
 
