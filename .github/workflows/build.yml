@@ -257,11 +257,11 @@ jobs:
           else
             echo "::warning::no official checksum available for this version — continuing without verification"
           fi
-          TOP="$(tar -tzf src.tar.gz | head -n1 | cut -d/ -f1)"
-          echo "tarball top-level dir: $TOP"
+          # Official mirror tarballs always extract to a top-level "mariadb-$V"
+          # directory (deterministic — avoids `tar | head` which trips pipefail/SIGPIPE).
           rm -rf src
           tar -xzf src.tar.gz
-          mv "$TOP" src
+          mv "mariadb-$V" src
           test -f src/CMakeLists.txt
 
       - name: Install Bison (winflexbison + name bridge)
@@ -343,11 +343,19 @@ jobs:
           V="${MARIADB_VERSION}"
           SLUG="${{ matrix.slug }}"
           mkdir -p dist
-          MAIN="$(find bld -maxdepth 1 -name '*.zip' ! -iname '*debugsymbol*' | head -n1)"
-          DBG="$(find bld -maxdepth 1 -iname '*debugsymbol*.zip' | head -n1)"
-          [ -n "$MAIN" ] || { echo "::error::win_package produced no distribution zip"; ls bld; exit 1; }
+          # win_package produces deterministic names: mariadb-$V-winx64.zip
+          # and mariadb-$V-winx64-debugsymbols.zip (with a glob fallback just in case).
+          MAIN="bld/mariadb-$V-winx64.zip"
+          if [ ! -f "$MAIN" ]; then
+            MAIN="$(ls -1 bld/*.zip 2>/dev/null | grep -vi debugsymbol | head -n1 || true)"
+          fi
+          DBG="bld/mariadb-$V-winx64-debugsymbols.zip"
+          if [ ! -f "$DBG" ]; then
+            DBG="$(ls -1 bld/*.zip 2>/dev/null | grep -i debugsymbol | head -n1 || true)"
+          fi
+          [ -n "$MAIN" ] && [ -f "$MAIN" ] || { echo "::error::win_package produced no distribution zip"; ls bld; exit 1; }
           cp "$MAIN" "dist/mariadb-$V-winx64-$SLUG.zip"
-          if [ -n "$DBG" ]; then
+          if [ -n "$DBG" ] && [ -f "$DBG" ]; then
             cp "$DBG" "dist/mariadb-$V-winx64-$SLUG-debugsymbols.zip"
           else
             echo "::warning::no debugsymbols zip found"
