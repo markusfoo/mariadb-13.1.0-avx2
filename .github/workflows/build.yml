@@ -215,7 +215,7 @@ jobs:
 
       - name: Cache MariaDB source tarball
         id: srccache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: src.tar.gz
           key: mariadb-source-${{ needs.resolve.outputs.version }}
