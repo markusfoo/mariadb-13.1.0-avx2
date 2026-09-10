@@ -1,0 +1,7 @@
+# build outputs
+src/
+bld/
+dist/
+src.tar.gz
+*.zip
+*.msi

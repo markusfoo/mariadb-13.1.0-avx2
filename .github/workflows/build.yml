@@ -1,0 +1,534 @@
+name: Build MariaDB for Windows x64
+
+# Universal, version-agnostic MariaDB Windows build pipeline.
+#
+#   * resolve  — a "dev version checker": discovers the newest upstream release at
+#                run time (rolling/preview releases are published as tarballs on the
+#                mirrors, NOT as git tags, so we scrape the mirror index + rest-api).
+#   * build    — 3-way matrix: AVX2 / AVX / generic (SSE2 baseline), portable ZIPs
+#                via the official win_package target, flags audit + server smoke boot.
+#   * release  — tag vX.Y.Z, notes, SHA256SUMS, all assets; Preview/RC → pre-release.
+#
+# Triggers: weekly auto-check (Mon 02:30 UTC), manual dispatch, workflow-file pushes.
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: "auto = newest upstream release; or a series like 11.8 / 12.3; or an exact version like 13.1.0"
+        required: false
+        default: "auto"
+        type: string
+      force:
+        description: "Rebuild even if this version already has a release here"
+        required: false
+        default: false
+        type: boolean
+      build_msi:
+        description: "Also build the MSI installer (best-effort, WiX 3)"
+        required: false
+        default: false
+        type: boolean
+  schedule:
+    - cron: "30 2 * * 1"
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/build.yml"
+
+permissions:
+  contents: write
+
+concurrency:
+  # One build per (event, source) at a time; different sources run in parallel.
+  group: build-${{ github.event_name }}-${{ github.event.inputs.source_ref || 'auto' }}
+  cancel-in-progress: false
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────────────────
+  # 1. Version checker — resolve what to build
+  # ─────────────────────────────────────────────────────────────────────────────
+  resolve:
+    name: Resolve upstream version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      series: ${{ steps.v.outputs.series }}
+      release_name: ${{ steps.v.outputs.release_name }}
+      source_url: ${{ steps.v.outputs.source_url }}
+      sha256: ${{ steps.v.outputs.sha256 }}
+      prerelease: ${{ steps.v.outputs.prerelease }}
+      skip: ${{ steps.v.outputs.skip }}
+    steps:
+      - name: Find the newest MariaDB source release
+        id: v
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_REF: ${{ inputs.source_ref || 'auto' }}
+          FORCE: ${{ inputs.force || 'false' }}
+        run: |
+          set -euo pipefail
+          INPUT="${INPUT_REF:-auto}"
+
+          # Rolling releases (13.1.x, ...) exist only as tarballs on the mirrors —
+          # the mirror/archive index is the authoritative list of versions.
+          list_versions() {
+            {
+              curl -fsSL --retry 3 --max-time 60 https://archive.mariadb.org/ \
+                || curl -fsSL --retry 3 --max-time 60 https://mirror.mariadb.org/
+            } | grep -oE 'mariadb-[0-9]+\.[0-9]+\.[0-9]+' | sed 's/^mariadb-//' | sort -uV
+          }
+          VERSIONS="$(list_versions)"
+          [ -n "$VERSIONS" ] || { echo "::error::could not list MariaDB releases from mirrors"; exit 1; }
+          echo "Known upstream versions (tail): $(printf '%s ' $(printf '%s\n' "$VERSIONS" | tail -n8))"
+
+          if [ "$INPUT" = "auto" ]; then
+            VERSION="$(printf '%s\n' "$VERSIONS" | tail -n1)"
+          elif [[ "$INPUT" =~ ^[0-9]+\.[0-9]+$ ]]; then
+            VERSION="$(printf '%s\n' "$VERSIONS" | grep -E "^${INPUT//./\\.}\.[0-9]+$" | tail -n1 || true)"
+            [ -n "$VERSION" ] || { echo "::error::no release found for series $INPUT"; exit 1; }
+          elif [[ "$INPUT" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            VERSION="$INPUT"
+          else
+            echo "::error::unsupported source_ref '$INPUT' (use auto, a series like 11.8, or X.Y.Z)"
+            exit 1
+          fi
+          SERIES="${VERSION%.*}"
+
+          # Best-effort metadata from the official downloads REST API:
+          # release name (Preview/RC detection) + official source tarball SHA-256.
+          RELEASE_NAME="MariaDB Server $VERSION"
+          SHA256=""
+          PRERELEASE=false
+          META="$(curl -fsSL --retry 2 --max-time 30 "https://downloads.mariadb.org/rest-api/mariadb/${SERIES}/" || true)"
+          if [ -n "$META" ]; then
+            # NOTE: the python program comes from a heredoc (stdin), so the JSON is
+            # passed via an environment variable to avoid the stdin conflict.
+            PARSED="$(META_JSON="$META" python3 - "$VERSION" <<'PY'
+          import json, os, sys
+          v = sys.argv[1]
+          try:
+              d = json.loads(os.environ.get("META_JSON", ""))
+              rel = (d.get("releases") or {}).get(v) or {}
+              name = rel.get("release_name") or ""
+              sha = ""
+              for f in rel.get("files") or []:
+                  if f.get("file_name") == "mariadb-%s.tar.gz" % v:
+                      sha = (f.get("checksum") or {}).get("sha256sum") or ""
+                      break
+              pre = any(w in name.upper() for w in ("PREVIEW", "ALPHA", "BETA", "RC", "GAMMA"))
+              print(name)
+              print(sha)
+              print("true" if pre else "false")
+          except Exception:
+              pass
+          PY
+            )"
+            RELEASE_NAME="$(printf '%s' "$PARSED" | sed -n 1p)"; RELEASE_NAME="${RELEASE_NAME:-MariaDB Server $VERSION}"
+            SHA256="$(printf '%s' "$PARSED" | sed -n 2p)"
+            PRERELEASE="$(printf '%s' "$PARSED" | sed -n 3p)"; [ "$PRERELEASE" = "true" ] || PRERELEASE=false
+          else
+            echo "::warning::downloads REST API unavailable — skipping metadata/prerelease detection"
+          fi
+
+          # Skip if this version was already released here (unless force).
+          SKIP=false
+          if [ "$FORCE" != "true" ]; then
+            CODE="$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $GH_TOKEN" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/v${VERSION}")"
+            if [ "$CODE" = "200" ]; then
+              SKIP=true
+              echo "Release v${VERSION} already exists — nothing to do."
+            fi
+          fi
+
+          {
+            echo "version=$VERSION"
+            echo "series=$SERIES"
+            echo "release_name=$RELEASE_NAME"
+            echo "source_url=https://archive.mariadb.org/mariadb-${VERSION}/source/mariadb-${VERSION}.tar.gz"
+            echo "sha256=$SHA256"
+            echo "prerelease=$PRERELEASE"
+            echo "skip=$SKIP"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Version check"
+            echo ""
+            echo "- Resolved: **$RELEASE_NAME**"
+            echo "- Version: \`${VERSION}\` (series ${SERIES})"
+            echo "- Upstream tarball: [\`mariadb-${VERSION}.tar.gz\`](https://archive.mariadb.org/mariadb-${VERSION}/source/mariadb-${VERSION}.tar.gz)"
+            echo "- Official SHA-256: \`${SHA256:-(unavailable)}\`"
+            echo "- Pre-release: ${PRERELEASE}"
+            echo "- Already released here: ${SKIP}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # 2. Build matrix — AVX2 / AVX / generic (SSE2)
+  # ─────────────────────────────────────────────────────────────────────────────
+  build:
+    name: Build ${{ matrix.variant }}
+    needs: resolve
+    if: needs.resolve.outputs.skip != 'true'
+    runs-on: windows-latest
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: AVX2
+            slug: avx2
+            arch_flag: "/arch:AVX2"
+            expect_flag: "/arch:AVX2"
+          - variant: AVX
+            slug: avx
+            arch_flag: "/arch:AVX"
+            expect_flag: "/arch:AVX-"
+          - variant: Generic
+            slug: generic
+            arch_flag: ""
+            expect_flag: "none"
+    env:
+      MARIADB_VERSION: ${{ needs.resolve.outputs.version }}
+      RELEASE_NAME: ${{ needs.resolve.outputs.release_name }}
+      EXPECTED_SHA256: ${{ needs.resolve.outputs.sha256 }}
+    steps:
+      - name: Host info
+        shell: pwsh
+        run: |
+          Get-CimInstance Win32_Processor | Select-Object Name, NumberOfCores
+          Get-PSDrive -Name C, D | Select-Object Name, @{n='FreeGB';e={[math]::Round($_.Free/1GB,1)}}
+          (Get-CimInstance Win32_OperatingSystem).Caption
+
+      - name: Free disk space (best-effort)
+        shell: pwsh
+        run: |
+          $free = (Get-PSDrive D -ErrorAction SilentlyContinue)
+          if (-not $free) { $free = Get-PSDrive C }
+          if ($free.Free -lt 40GB) {
+            foreach ($t in @('C:\Android','C:\ghcup','C:\haskell','C:\MinGW')) {
+              if (Test-Path $t) { Remove-Item $t -Recurse -Force -ErrorAction SilentlyContinue }
+            }
+          }
+          "Free space: {0:N1} GB" -f ($free.Free/1GB)
+
+      - name: Cache MariaDB source tarball
+        id: srccache
+        uses: actions/cache@v4
+        with:
+          path: src.tar.gz
+          key: mariadb-source-${{ needs.resolve.outputs.version }}
+
+      - name: Download and verify MariaDB ${{ needs.resolve.outputs.version }} sources
+        if: steps.srccache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          V="${MARIADB_VERSION}"
+          urls=(
+            "https://distrohub.kyiv.ua/mariadb/mariadb-$V/source/mariadb-$V.tar.gz"
+            "https://mirror.mariadb.org/mariadb-$V/source/mariadb-$V.tar.gz"
+            "https://archive.mariadb.org/mariadb-$V/source/mariadb-$V.tar.gz"
+          )
+          ok=""
+          for u in "${urls[@]}"; do
+            echo "Downloading: $u"
+            if curl -fL --retry 3 --retry-delay 5 --connect-timeout 30 -o src.tar.gz "$u"; then ok="$u"; break; fi
+            echo "::warning::mirror failed: $u — trying next"
+            rm -f src.tar.gz
+          done
+          [ -n "$ok" ] || { echo "::error::all mirrors failed for mariadb-$V.tar.gz"; exit 1; }
+          echo "Downloaded from: $ok ($(stat -c%s src.tar.gz) bytes)"
+
+      - name: Verify source checksum and extract
+        shell: bash
+        run: |
+          set -euo pipefail
+          ACTUAL="$(sha256sum src.tar.gz | awk '{print $1}')"
+          echo "sha256(mariadb-$V.tar.gz) = $ACTUAL"
+          if [ -n "$EXPECTED_SHA256" ] && [ "$EXPECTED_SHA256" != "-" ]; then
+            if [ "$ACTUAL" = "$EXPECTED_SHA256" ]; then
+              echo "✓ checksum matches the official MariaDB release manifest"
+            else
+              echo "::error::SHA-256 mismatch! expected $EXPECTED_SHA256"; exit 1
+            fi
+          else
+            echo "::warning::no official checksum available for this version — continuing without verification"
+          fi
+          TOP="$(tar -tzf src.tar.gz | head -n1 | cut -d/ -f1)"
+          echo "tarball top-level dir: $TOP"
+          rm -rf src
+          tar -xzf src.tar.gz
+          mv "$TOP" src
+          test -f src/CMakeLists.txt
+
+      - name: Install Bison (winflexbison + name bridge)
+        shell: pwsh
+        run: |
+          choco install -y --no-progress winflexbison3
+          $t = 'C:\ProgramData\chocolatey\lib\winflexbison3\tools'
+          if (-not (Test-Path "$t\win_bison.exe")) { throw "win_bison.exe not found at $t" }
+          # win_bison must run from its own dir (data/m4sugar); bridge the classic names.
+          Copy-Item "$t\win_bison.exe" "$t\bison.exe" -Force
+          Copy-Item "$t\win_flex.exe" "$t\flex.exe" -Force
+          & "$t\bison.exe" --version
+          Add-Content $env:GITHUB_PATH $t
+          echo "BISON_DIR=$t" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Configure (CMake, MSVC, ${{ matrix.variant }})
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $flags = '${{ matrix.arch_flag }}'
+          cmake --version
+          # Generator is auto-detected (VS Enterprise 2026 on current runners;
+          # works with any future VS too). Platform is forced to x64.
+          cmake -S src -B bld -A x64 `
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo `
+            "-DCMAKE_C_FLAGS_RELWITHDEBINFO=/O2 /Ob1 /DNDEBUG $flags" `
+            "-DCMAKE_CXX_FLAGS_RELWITHDEBINFO=/O2 /Ob1 /DNDEBUG $flags" `
+            "-DBISON_EXECUTABLE=$env:BISON_DIR\bison.exe" `
+            "-DFLEX_EXECUTABLE=$env:BISON_DIR\flex.exe"
+          Select-String -Path bld\CMakeCache.txt -Pattern 'CMAKE_GENERATOR:|CMAKE_(C|CXX)_FLAGS_RELWITHDEBINFO'
+
+      - name: Audit compiler flags (${{ matrix.variant }})
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $expect = '${{ matrix.expect_flag }}'
+          $cache = Get-Content bld\CMakeCache.txt -Raw
+          $cflags = [regex]::Match($cache, 'CMAKE_CXX_FLAGS_RELWITHDEBINFO:STRING=(.*)').Groups[1].Value
+          $cflags = $cflags.Trim()
+          "Cached CXX RelWithDebInfo flags: $cflags"
+          $fail = $false
+          switch ($expect) {
+            '/arch:AVX2' { if ($cflags -notmatch '/arch:AVX2') { $fail = $true } }
+            '/arch:AVX-' { if ($cflags -notmatch '/arch:AVX(?!2)') { $fail = $true } }
+            'none'       { if ($cflags -match '/arch:') { $fail = $true } }
+          }
+          if ($fail) { throw "Flag audit failed: expected $expect, got '$cflags'" }
+          "✓ Flag audit passed ($expect)"
+
+      - name: Compile
+        shell: pwsh
+        run: cmake --build bld --config RelWithDebInfo --parallel
+
+      - name: Package portable ZIPs (win_package)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Two-phase: compile first (done above), then run the packaging target —
+          # required with current MSBuild, which reorders CPack rules otherwise.
+          cmake --build bld --config RelWithDebInfo --target win_package
+          Get-ChildItem bld -Filter *.zip | Select-Object Name, Length
+
+      - name: Build MSI (optional, best-effort)
+        if: ${{ inputs.build_msi == true }}
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          choco install -y --no-progress wixtoolset
+          $wix = Get-ChildItem 'C:\Program Files (x86)' -Directory -Filter 'WiX Toolset*' |
+                 Select-Object -First 1 -ExpandProperty FullName
+          if ($wix) { $env:Path = "$wix\bin;$env:Path" }
+          cmake --build bld --config RelWithDebInfo --target MSI
+          Get-ChildItem bld -Filter *.msi | Select-Object Name, Length
+
+      - name: Collect and rename artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          V="${MARIADB_VERSION}"
+          SLUG="${{ matrix.slug }}"
+          mkdir -p dist
+          MAIN="$(find bld -maxdepth 1 -name '*.zip' ! -iname '*debugsymbol*' | head -n1)"
+          DBG="$(find bld -maxdepth 1 -iname '*debugsymbol*.zip' | head -n1)"
+          [ -n "$MAIN" ] || { echo "::error::win_package produced no distribution zip"; ls bld; exit 1; }
+          cp "$MAIN" "dist/mariadb-$V-winx64-$SLUG.zip"
+          if [ -n "$DBG" ]; then
+            cp "$DBG" "dist/mariadb-$V-winx64-$SLUG-debugsymbols.zip"
+          else
+            echo "::warning::no debugsymbols zip found"
+          fi
+          for MSI in bld/*.msi; do
+            [ -f "$MSI" ] && cp "$MSI" "dist/mariadb-$V-winx64-$SLUG.msi"
+          done
+          VSWHERE="$(printenv 'ProgramFiles(x86)' 2>/dev/null)/Microsoft Visual Studio/Installer/vswhere.exe"
+          VSVER=""
+          [ -f "$VSWHERE" ] && VSVER="$("$VSWHERE" -latest -property catalog_productDisplayVersion 2>/dev/null | head -n1)"
+          {
+            echo "MariaDB $V — Windows x64 (${{ matrix.variant }})"
+            echo "release_name   : ${RELEASE_NAME}"
+            echo "variant        : ${{ matrix.variant }} (slug: $SLUG)"
+            echo "arch_flag      : ${{ matrix.arch_flag }} (empty = SSE2 baseline)"
+            echo "build_type     : RelWithDebInfo (/O2 /Ob1 /DNDEBUG)"
+            echo "generator      : $(grep -m1 'CMAKE_GENERATOR:INTERNAL=' bld/CMakeCache.txt | cut -d= -f2)"
+            echo "visual_studio  : ${VSVER:-unknown}"
+            echo "source_tarball : mariadb-$V.tar.gz"
+            echo "source_sha256  : ${EXPECTED_SHA256:-unverified}"
+            echo "runner         : windows-latest (ImageOS ${ImageOS:-unknown})"
+            echo "built_by       : $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          } > "dist/BUILD-INFO-$SLUG.txt"
+          ls -la dist/
+
+      - name: Smoke test — boot the packaged server
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $v   = "$env:MARIADB_VERSION"
+          $zip = "dist/mariadb-$v-winx64-${{ matrix.slug }}.zip"
+          $root = "$env:RUNNER_TEMP\smoke"
+          if (Test-Path $root) { Remove-Item $root -Recurse -Force }
+          Expand-Archive -Path $zip -DestinationPath $root
+          $pkg  = Get-ChildItem $root -Directory | Select-Object -First 1
+          $bin  = Join-Path $pkg.FullName 'bin'
+          $svr  = Join-Path $bin 'mariadbd.exe'
+          if (-not (Test-Path $svr)) { throw "mariadbd.exe missing in package" }
+
+          # 1) --version works with no data directory (always available)
+          $verline = & $svr --version
+          "server version line: $verline"
+          if ("$verline" -notmatch [regex]::Escape($v)) { throw "version mismatch: '$verline'" }
+
+          # 2) full boot on the shipped (or freshly installed) data directory
+          $data = Join-Path $pkg.FullName 'data'
+          if (-not (Test-Path $data)) {
+            $inst = Join-Path $bin 'mariadb-install-db.exe'
+            if (Test-Path $inst) { & $inst "--datadir=$data" } else {
+              Write-Output "::warning::no data dir and no mariadb-install-db.exe — skipping full boot"
+              return
+            }
+          }
+          $port = 3399
+          $out  = "$env:RUNNER_TEMP\smoke-server.log"
+          $srvArgs = @("--console", "--skip-grant-tables", "--bind-address=127.0.0.1",
+                       "--port=$port", "--datadir=$data")
+          $p = Start-Process -FilePath $svr -PassThru -WindowStyle Hidden `
+                -RedirectStandardOutput $out -RedirectStandardError "$out.err" `
+                -ArgumentList $srvArgs
+          try {
+            $ok = $false
+            for ($i = 0; $i -lt 60 -and -not $p.HasExited; $i++) {
+              Start-Sleep -Seconds 2
+              $r = & (Join-Path $bin 'mariadb.exe') -h 127.0.0.1 -P $port -u root `
+                    --connect-timeout=2 -N -B -e "SELECT VERSION();" 2>$null
+              if ($LASTEXITCODE -eq 0 -and $r) { $ok = $true; break }
+            }
+            if ($p.HasExited) {
+              Get-Content $out, "$out.err" -ErrorAction SilentlyContinue
+              throw "server exited during smoke test (exit code $($p.ExitCode))"
+            }
+            if (-not $ok) {
+              Get-Content $out, "$out.err" -ErrorAction SilentlyContinue
+              throw "server never became reachable on port $port"
+            }
+            "✓ Server up: $r"
+            if ("$r" -notmatch [regex]::Escape($v)) { throw "booted version '$r' != expected '$v'" }
+            & (Join-Path $bin 'mariadb.exe') -h 127.0.0.1 -P $port -u root -e "SHOW DATABASES; SELECT @@version_comment;"
+          } finally {
+            & (Join-Path $bin 'mariadb-admin.exe') -h 127.0.0.1 -P $port -u root shutdown 2>$null
+            if (-not $p.WaitForExit(30000)) { Stop-Process -Id $p.Id -Force }
+            "✓ Clean shutdown"
+            Get-Content $out -Tail 12 -ErrorAction SilentlyContinue
+          }
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mariadb-winx64-${{ matrix.slug }}
+          path: dist/*
+          retention-days: 90
+          compression-level: 0
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # 3. Release — tag, notes, checksums, assets
+  # ─────────────────────────────────────────────────────────────────────────────
+  release:
+    name: Publish release v${{ needs.resolve.outputs.version }}
+    needs: [resolve, build]
+    if: needs.resolve.outputs.skip != 'true' && needs.build.result == 'success'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      VERSION: ${{ needs.resolve.outputs.version }}
+      RELEASE_NAME: ${{ needs.resolve.outputs.release_name }}
+      SERIES: ${{ needs.resolve.outputs.series }}
+      PRERELEASE: ${{ needs.resolve.outputs.prerelease }}
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+
+      - name: Prepare assets, notes and checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p rel
+          find . -name 'mariadb-*.zip' -exec cp {} rel/ \;
+          find . -name 'mariadb-*.msi' -exec cp {} rel/ \; 2>/dev/null || true
+          cat */BUILD-INFO-*.txt > rel/BUILD_INFO.txt
+          cat rel/BUILD_INFO.txt
+
+          cd rel && sha256sum * > SHA256SUMS.txt && cd ..
+
+          {
+            echo "## ${RELEASE_NAME} — Windows x64"
+            echo
+            echo "Built automatically from the official upstream tarball [\`mariadb-${VERSION}.tar.gz\`](https://archive.mariadb.org/mariadb-${VERSION}/source/mariadb-${VERSION}.tar.gz) (series ${SERIES}) with Visual Studio + CMake on GitHub Actions."
+            echo
+            echo "### Assets"
+            echo
+            echo "| Asset | Instruction set | For |"
+            echo "|---|---|---|"
+            echo "| \`mariadb-${VERSION}-winx64-avx2.zip\` | AVX2 + FMA (VEX) | Haswell (2013)+, Zen+ |"
+            echo "| \`mariadb-${VERSION}-winx64-avx.zip\` | AVX | Sandy/Ivy Bridge |"
+            echo "| \`mariadb-${VERSION}-winx64-generic.zip\` | SSE2 baseline | any x64 CPU/VM |"
+            echo "| \`*-debugsymbols.zip\` | PDB symbols | crash analysis |"
+            echo
+            echo "Each package is a **portable ZIP** (unpacked \`bin\`, \`data\`, \`share\`, \`lib\` …) — ready to run, XAMPP-friendly. The version is auto-detected from upstream at build time; every flavour is boot-tested in CI before publishing."
+            echo
+            echo "### Checksums"
+            echo
+            echo '```'
+            cat rel/SHA256SUMS.txt
+            echo '```'
+            echo
+            echo "### XAMPP upgrade? Read this first"
+            echo
+            echo "If your old data directory throws \`Incorrect definition of table mysql.event\` / \`System triggers not loaded\`, that is the old system-table layout — not a broken build. See the [upgrade fix](https://github.com/${GITHUB_REPOSITORY}#-fixing-incorrect-definition-of-table-mysqlevent-xampp) in the README."
+          } > notes.md
+          cat notes.md
+
+      - name: Create tag and release, upload assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="v$VERSION"
+          EXTRA=()
+          if [ "$PRERELEASE" = "true" ]; then EXTRA=(--prerelease); fi
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists — updating assets"
+            gh release edit "$TAG" --notes-file notes.md || true
+          else
+            gh release create "$TAG" --target "$GITHUB_SHA" \
+              --title "${RELEASE_NAME} — Windows x64 (AVX2 / AVX / Generic)" \
+              --notes-file notes.md "${EXTRA[@]}"
+          fi
+          gh release upload "$TAG" rel/mariadb-*.zip rel/SHA256SUMS.txt rel/BUILD_INFO.txt --clobber
+          # optional MSIs, if any flavour produced them
+          if ls rel/*.msi >/dev/null 2>&1; then
+            gh release upload "$TAG" rel/*.msi --clobber
+          fi
+          echo "Release published: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/$TAG"
+
+      - name: Summary
+        shell: bash
+        run: |
+          {
+            echo "### Released"
+            echo ""
+            echo "**${RELEASE_NAME}** → [$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/v$VERSION](https://github.com/$GITHUB_REPOSITORY/releases/tag/v$VERSION)"
+            echo ""
+            echo "Pre-release: ${PRERELEASE}"
+          } >> "$GITHUB_STEP_SUMMARY"
