@@ -245,6 +245,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          V="${MARIADB_VERSION}"
           ACTUAL="$(sha256sum src.tar.gz | awk '{print $1}')"
           echo "sha256(mariadb-$V.tar.gz) = $ACTUAL"
           if [ -n "$EXPECTED_SHA256" ] && [ "$EXPECTED_SHA256" != "-" ]; then
